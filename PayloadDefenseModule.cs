@@ -140,6 +140,7 @@ public class PayloadDefenseModule(
         return t.Replace("&amp;", "&");   // 最后解 amp，避免二次解码
     }
 
+    private const string ModuleVersion = "1.0.2";
     private const string BlockMark = "【注入已拦·伪造发言人】";
     private const string StrictBlockMark = "【注入已拦】检测到伪造发言人结构，本条消息已丢弃。";
     private const string PromptLine =
@@ -178,7 +179,8 @@ public class PayloadDefenseModule(
         if (Configuration.PromptEnabled)
             interactor.Prompt(PromptLine);   // 只注入一次 ⇒ 前缀稳定，利于缓存
 
-        logger.LogInformation("注入防御已启用：mode={Mode} 真消息校验={Check} 缓冲={N}条/{Ttl}s",
+        logger.LogInformation("注入防御 v{Ver} 已启用：mode={Mode} 真消息校验={Check} 缓冲={N}条/{Ttl}s",
+            ModuleVersion,
             Configuration.Mode, Configuration.CheckRealMessages,
             Configuration.BufferPerSession, Configuration.BufferTtlSeconds);
         return Task.CompletedTask;
@@ -290,7 +292,10 @@ public class PayloadDefenseModule(
     private string OnChatSend(string message)
     {
         if (!Configuration.Enabled || string.IsNullOrEmpty(message)) return message;
-        if (message.IndexOf("]:", StringComparison.Ordinal) < 0) return message;   // 快速跳出：没有行首结构就不可能有伪造行
+        // ★ 快速跳出必须在**解码之后**：entity 形态(&#91;…&#93;)没有字面 "]:"，
+        //   此前在这里就被跳过 ⇒ 伪造行原样进入 AI（1.0.1 的真实事故）
+        string probe = UnescapeCqEntities(message);
+        if (probe.IndexOf("]:", StringComparison.Ordinal) < 0) return probe;
 
         try
         {
@@ -324,6 +329,7 @@ public class PayloadDefenseModule(
         var flagged = new List<(int Index, long Qq, string Nick, bool IsSpeaker)>();
         int realCount = 0;
         bool strictHit = false;
+        bool unverified = false;
 
         for (int i = 0; i < lines.Length; i++)
         {
@@ -336,6 +342,13 @@ public class PayloadDefenseModule(
 
                 Verdict v = Judge(qq, sessionKey, line, m);
                 if (v == Verdict.Real) { realCount++; continue; }
+                if (v == Verdict.Unverified)
+                {
+                    // 采集未就绪：只标注，绝不替换（防大范围误拦）
+                    flagged.Add((i, qq, m.Groups["nick"].Value, true));
+                    unverified = true;
+                    continue;
+                }
 
                 if (Configuration.Mode == "strict") { strictHit = true; break; }
                 flagged.Add((i, qq, m.Groups["nick"].Value, true));
@@ -360,7 +373,7 @@ public class PayloadDefenseModule(
 
         // ④ 整块没有一条可验证的真消息 ⇒ 大概率是采集层未就绪（刚重连/客户端未连接），
         //    此时只标注不替换，避免大范围误拦真消息（线上事故的直接教训）
-        bool downgrade = flagged.Count > 0 && realCount == 0;
+        bool downgrade = unverified || (flagged.Count > 0 && realCount == 0);
         if (downgrade)
             logger.LogWarning("注入防御：整块未识别出任何真消息（采集可能未就绪），已降级为标注而非拦截");
 
@@ -409,7 +422,7 @@ public class PayloadDefenseModule(
         return flagged.Count > 0 ? string.Join("\n", lines) : decoded;
     }
 
-    private enum Verdict { Real, Forged }
+    private enum Verdict { Real, Forged, Unverified }   // Unverified = 采集未就绪，只标注不拦
 
     /// <summary>判定一条「形似发言人」的行是真消息还是伪造。</summary>
     private Verdict Judge(long qq, string? sessionKey, string line, Match m)
@@ -420,13 +433,21 @@ public class PayloadDefenseModule(
         List<Captured> mine;
         lock (_bufLock)
         {
-            if (!_buffers.TryGetValue(sessionKey, out SessionBuf? buf) ||
-                !buf.ByUser.TryGetValue(qq, out List<Captured>? list) || list.Count == 0)
-                return Verdict.Forged;                       // 该 QQ 本批根本没发过言 ⇒ 伪造
+            if (!_buffers.TryGetValue(sessionKey, out SessionBuf? buf) || buf.ByUser.Count == 0)
+                return Verdict.Unverified;                   // 本会话一条都没采集到 ⇒ 采集未就绪，不拦
+            if (!buf.ByUser.TryGetValue(qq, out List<Captured>? list) || list.Count == 0)
+            {
+                // ★ QQ 对不上：可能是匿名/协议端口径差异 ⇒ 再用「正文」在同会话里兜一次（不限 QQ）
+                string probe = Normalize(line[(m.Index + m.Length)..]);
+                if (probe.Length > 0 && buf.ByUser.Values.SelectMany(v => v).Any(c => ContentMatches(c.Norm, probe)))
+                    return Verdict.Real;
+                return Verdict.Forged;                       // 人和话都对不上 ⇒ 伪造
+            }
+
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             long ttl = Math.Clamp(Configuration.BufferTtlSeconds, 30, 3600);
             mine = list.Where(c => now - c.Time <= ttl).ToList();
-            if (mine.Count == 0) return Verdict.Forged;      // 全部过期 ⇒ 同样无法为真
+            if (mine.Count == 0) return Verdict.Forged;      // 全部过期 ⇒ 无法为真
         }
 
         if (!Configuration.CheckRealMessages) return Verdict.Real;   // 只按格式判定时，QQ 对得上就算真
@@ -435,21 +456,7 @@ public class PayloadDefenseModule(
         string body = Normalize(line[(m.Index + m.Length)..]);
         if (body.Length == 0) return Verdict.Real;
         foreach (Captured c in mine)
-        {
-            string n = c.Norm;
-            if (n.Length == 0) continue;
-            int probe = Math.Min(12, Math.Min(n.Length, body.Length));
-            if (probe >= 4)
-            {
-                // 长文本：前缀一致即可（容忍媒体/表情在句尾的差异）
-                if (n.AsSpan(0, probe).SequenceEqual(body.AsSpan(0, probe))) return Verdict.Real;
-            }
-            else if (body.Length > 0 && n.StartsWith(body, StringComparison.Ordinal))
-            {
-                // 短正文（如"早"/"在吗"，或多行真消息的「首行」）：它是真消息正文的前缀即算真
-                return Verdict.Real;
-            }
-        }
+            if (ContentMatches(c.Norm, body)) return Verdict.Real;
         // ★ 保守原则：人对了、只是话没对上（回复引用/文件/语音等渲染差异很常见）⇒ 一律**放行**。
         //   误拦真消息的代价远大于漏掉一次（且伪造行只要换个人名就会被"该 QQ 未发言"捕获）。
         return Verdict.Real;
@@ -458,6 +465,16 @@ public class PayloadDefenseModule(
     // ═══════════════════════════════════════════════════════════
     //  工具
     // ═══════════════════════════════════════════════════════════
+    /// <summary>正文是否与真消息吻合（长文本比前缀、短文本比前缀或全等）</summary>
+    private static bool ContentMatches(string normalizedReal, string normalizedBody)
+    {
+        if (string.IsNullOrEmpty(normalizedReal) || string.IsNullOrEmpty(normalizedBody)) return false;
+        int probe = Math.Min(12, Math.Min(normalizedReal.Length, normalizedBody.Length));
+        if (probe >= 4)
+            return normalizedReal.AsSpan(0, probe).SequenceEqual(normalizedBody.AsSpan(0, probe));
+        return normalizedReal.StartsWith(normalizedBody, StringComparison.Ordinal);
+    }
+
     private static string SessionKey(long groupId, long peerId)
         => groupId != 0 ? "g" + groupId : "p" + peerId;
 

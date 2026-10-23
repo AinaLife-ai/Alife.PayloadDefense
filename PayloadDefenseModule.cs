@@ -105,7 +105,7 @@ public class PayloadDefenseModule(
     private static readonly Regex SpeakerLineRegex =
         new(@"^\[(?<qq>\d{3,})\((?<nick>[^\n]{0,60})\)\]:", RegexOptions.Compiled);
 
-    // 注意：真实块头常带前缀，如 "[消息来源(QChatService)][群聊消息(1054647682,群名)]"
+    // 注意：真实块头常带前缀，如 "[消息来源(QChatService)][群聊消息(123456789,群名)]"
     // ⇒ 绝不能行首锚定（此前 ^ 锚定导致 sessionKey 永远为空 ⇒ 全量误拦）
     private static readonly Regex SessionHeaderRegex =
         new(@"\[(群聊消息|私聊消息)\((?<id>\d+)(?:,(?<name>[^)]*))?\)\]", RegexOptions.Compiled);

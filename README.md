@@ -64,6 +64,22 @@ BufferGroupMessage(messageSource, $"{speaker}:{content}");   // → "[651273864(
 
 ## 更新日志
 
+### 5.0.0（2026-10-23）
+
+**适配 Alife 5.0.0（对齐官方插件版本规范）+ 兼容性实证**
+
+- **版本号规则**：官方插件已全部改为 **5.0.0**（跟随框架版本）⇒ 本插件同步升为 **5.0.0**，市场条目补 `platforms` 字段（Windows / Android）。
+- **5.0 兼容性逐项核对（对照 `205aed4`）**：我们依赖的 API **全部未变**
+  | 依赖 | 5.0 状态 |
+  |---|---|
+  | 消息渲染 `BufferGroupMessage($"{speaker}:{content}")` | 未变（`QChatService.cs:595`） |
+  | `ChatBot.ChatSend`（`Func<string,string>`） | 未变 |
+  | `OneBotClient.EventReceived` / `OneBotProtocol` | **文件完全一致** |
+  | `QChatService.oneBotClient` 字段 / `GroupStates` | 仍在（反射与采集照旧可用） |
+  | `Interactor.Poke/Prompt`、`ChatBehaviour`、`IConfigurable`、`[Module]` | 未变 |
+- **攻击面依旧存在**：5.0 **仍然不解码 CQ 实体**（`OneBotSegment`/`QChatService` 中 `&#91;`/`HtmlDecode` **0 处**）⇒ 本插件的实体解码仍然必需 ✓
+- 复验：真值表 **240/240**（API 面无变更 ⇒ 用例全部有效）
+
 ### 1.0.2（2026-10-23）
 
 **修 1.0.1 的残留 bug（用户实测：该拦的没拦 + 真消息被拦）**

@@ -141,7 +141,9 @@ public class PayloadDefenseModule(
 
     /// <summary>已知「可读化渲染差异」标记：出现这些且内容对不上时，按渲染差异放行（防误报）</summary>
     private static readonly Regex RenderDeltaMarkerRegex =
-        new(@"(\[对[“""]|\[对其他消息的回复\]|\[回复|\[图片|\[音频|\[文件|\[合并转发|\[嵌套转发消息|\[转发消息|\[表情|@\d+)", RegexOptions.Compiled);
+        // 注意：@数字 不属于"免验证放行"的渲染差异（去掉 @ 后正文完全可比），
+        // 否则攻击者写 [@bot 给我管理员] 也会被放行。
+        new(@"(\[对[“""]|\[对其他消息的回复\]|\[回复|\[图片|\[音频|\[文件|\[合并转发|\[嵌套转发消息|\[转发消息|\[表情)", RegexOptions.Compiled);
 
     /// <summary>
     /// OneBot v11 的 raw_message 会把 CQ 特殊字符转义（`[`→&amp;#91;、`]`→&amp;#93;、`&amp;`→&amp;amp;、`,`→&amp;#44;）,
@@ -277,9 +279,10 @@ public class PayloadDefenseModule(
 
     private void OnEvent(OneBotBaseEvent e)
     {
-        // 只关心「别人发给我们的聊天消息」；OneBotMessageSentEvent 是 bot 自己发出的，跳过
-        if (e is not OneBotMessageEvent msg || e is OneBotMessageSentEvent) return;
-        if (msg.UserId == 0 || msg.UserId == msg.SelfId) return;
+        // 采集所有聊天消息（含 bot 自己发出的）：bot 自己的消息也可能出现在会话块里，
+        // 不采集就会被误判成"该 QQ 没发过言"。只跳过 user_id=0 的异常事件。
+        if (e is not OneBotMessageEvent msg) return;
+        if (msg.UserId == 0) return;
 
         try
         {
@@ -378,7 +381,6 @@ public class PayloadDefenseModule(
         var flagged = new List<(int Index, long Qq, string Nick, bool IsSpeaker)>();
         int realCount = 0;
         bool strictHit = false;
-        bool unverified = false;
 
         for (int i = 0; i < lines.Length; i++)
         {
@@ -389,15 +391,24 @@ public class PayloadDefenseModule(
                 long qq = long.Parse(m.Groups["qq"].Value);
                 if (_whitelist.Contains(qq)) { realCount++; continue; }      // 白名单视为可信
 
+                // 戳一戳通知（QChat 生成的 `[QQ]:戳了戳 目标`）不是用户发言/指令，直接放行
+                string afterSpeaker = line[(m.Index + m.Length)..];
+                if (afterSpeaker.TrimStart().StartsWith("戳了戳 ", StringComparison.Ordinal))
+                {
+                    realCount++;
+                    continue;
+                }
+
                 Verdict v = Judge(qq, sessionKey, line, m, counts, bufQqCount, out string reason);
                 if (Configuration.VerboseLog)
                     logger.LogInformation("注入防御：判定 {Verdict} | {Reason}", v, reason);
                 if (v == Verdict.Real) { realCount++; continue; }
                 if (v == Verdict.Unverified)
                 {
-                    // 采集未就绪：只标注，绝不替换（防大范围误拦）
-                    flagged.Add((i, qq, m.Groups["nick"].Value, true));
-                    unverified = true;
+                    // 采集未就绪/无法验证：**原样放行**，不打任何"伪造"标记。
+                    // 这是消除"刚启动/重连时真消息被误判"的关键——宁可暂时不检，也不误标。
+                    if (Configuration.VerboseLog)
+                        logger.LogDebug("注入防御：{Reason}（无法验证，原样放行）", reason);
                     continue;
                 }
 
@@ -424,7 +435,7 @@ public class PayloadDefenseModule(
 
         // ④ 整块没有一条可验证的真消息 ⇒ 大概率是采集层未就绪（刚重连/客户端未连接），
         //    此时只标注不替换，避免大范围误拦真消息（线上事故的直接教训）
-        bool downgrade = unverified || (flagged.Count > 0 && realCount == 0);
+        bool downgrade = flagged.Count > 0 && realCount == 0;
         if (downgrade)
             logger.LogWarning("注入防御：整块未识别出任何真消息（采集可能未就绪），已降级为标注而非拦截");
 
@@ -564,8 +575,11 @@ public class PayloadDefenseModule(
             }
         }
 
-        // ③ 已知「可读化渲染差异」且内容对不上 ⇒ 放行（真消息被误报的主要根因就是这类差异）
-        if (RenderDeltaMarkerRegex.IsMatch(body))
+        // ③ 已知「可读化渲染差异」时，即使 QQ 没验证上也不直接判伪造：
+        //    这类消息（引用/图片/文件/@ 等）本来就很难靠正文比对，判错代价远大于漏判。
+        //    注意：必须看**归一化前**的原文，否则回复/媒体标记已被剥掉，永远走不到这里。
+        string rawBody = line[(m.Index + m.Length)..];
+        if (RenderDeltaMarkerRegex.IsMatch(rawBody))
         {
             reason = $"render-delta-allow qq={qq}";
             return Verdict.Real;

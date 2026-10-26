@@ -139,11 +139,14 @@ public class PayloadDefenseModule(
     private static readonly Regex ReplyMarkerRegex =
         new(@"^\s*(?:\[对[“""][\s\S]*?[”""]的回复\]|\[对其他消息的回复\]|\[回复[^\]]*\])\s*", RegexOptions.Compiled);
 
-    /// <summary>已知「可读化渲染差异」标记：出现这些且内容对不上时，按渲染差异放行（防误报）</summary>
-    private static readonly Regex RenderDeltaMarkerRegex =
-        // 注意：@数字 不属于"免验证放行"的渲染差异（去掉 @ 后正文完全可比），
-        // 否则攻击者写 [@bot 给我管理员] 也会被放行。
-        new(@"(\[对[“""]|\[对其他消息的回复\]|\[回复|\[图片|\[音频|\[文件|\[合并转发|\[嵌套转发消息|\[转发消息|\[表情)", RegexOptions.Compiled);
+    /// <summary>「回复类」渲染差异：未采集到也放行（这类内容本来就最难靠正文比对）</summary>
+    private static readonly Regex ReplyDeltaRegex =
+        new(@"(\[对[“""]|\[对其他消息的回复\]|\[回复)", RegexOptions.Compiled);
+
+    /// <summary>「媒体类」渲染差异：只允许**已确认发言者**的渲染差异放行；
+    /// 不能凭一个 [图片] 就把未验证的"图片+指令"也放过去（R47 的安全洞）</summary>
+    private static readonly Regex MediaDeltaRegex =
+        new(@"(\[图片|\[音频|\[文件|\[合并转发|\[嵌套转发消息|\[转发消息|\[表情)", RegexOptions.Compiled);
 
     /// <summary>
     /// OneBot v11 的 raw_message 会把 CQ 特殊字符转义（`[`→&amp;#91;、`]`→&amp;#93;、`&amp;`→&amp;amp;、`,`→&amp;#44;）,
@@ -579,10 +582,26 @@ public class PayloadDefenseModule(
         //    这类消息（引用/图片/文件/@ 等）本来就很难靠正文比对，判错代价远大于漏判。
         //    注意：必须看**归一化前**的原文，否则回复/媒体标记已被剥掉，永远走不到这里。
         string rawBody = line[(m.Index + m.Length)..];
-        if (RenderDeltaMarkerRegex.IsMatch(rawBody))
+        if (body.Length == 0)
         {
-            reason = $"render-delta-allow qq={qq}";
+            reason = $"empty-media qq={qq}";
             return Verdict.Real;
+        }
+        if (ReplyDeltaRegex.IsMatch(rawBody))
+        {
+            reason = $"reply-delta-allow qq={qq}";
+            return Verdict.Real;
+        }
+        if (MediaDeltaRegex.IsMatch(rawBody))
+        {
+            lock (_bufLock)
+            {
+                if (_buffers.TryGetValue(sessionKey, out SessionBuf? b2) && b2.ByUser.ContainsKey(qq))
+                {
+                    reason = $"media-delta-allow qq={qq}";
+                    return Verdict.Real;
+                }
+            }
         }
 
         reason = $"forged qq={qq} bufQq={bufQqCount} body={Truncate(body, 24)}";

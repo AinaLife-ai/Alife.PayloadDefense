@@ -132,8 +132,16 @@ public class PayloadDefenseModule(
     private static readonly Regex MediaMarkerRegex =
         new(@"\[(?:图片|语音|视频|表情|文件|卡片|音乐|合并转发|嵌套转发消息|转发消息)(?:[:：][^\]]*)?\]", RegexOptions.Compiled);
     private static readonly Regex AtMarkerRegex = new(@"@\d+", RegexOptions.Compiled);
-    /// <summary>引用回复在「可读化」后会在行首加 [回复 …]，与 raw 里没有 ⇒ 比对前去掉</summary>
-    private static readonly Regex ReplyMarkerRegex = new(@"^\s*\[回复[^\]]*\]\s*", RegexOptions.Compiled);
+    /// <summary>
+    /// 引用回复在「可读化」后会在行首加 [对“{userId}：{内容}”的回复]（Alife FilterReply 的真实格式），
+    /// raw 里只有 [CQ:reply,id=…]，两边对不上 ⇒ 必须剥掉该前缀再比对（此前只剥 [回复 …]，漏了真实格式）
+    /// </summary>
+    private static readonly Regex ReplyMarkerRegex =
+        new(@"^\s*(?:\[对[“""][\s\S]*?[”""]的回复\]|\[对其他消息的回复\]|\[回复[^\]]*\])\s*", RegexOptions.Compiled);
+
+    /// <summary>已知「可读化渲染差异」标记：出现这些且内容对不上时，按渲染差异放行（防误报）</summary>
+    private static readonly Regex RenderDeltaMarkerRegex =
+        new(@"(\[对[“""]|\[对其他消息的回复\]|\[回复|\[图片|\[音频|\[文件|\[合并转发|\[嵌套转发消息|\[转发消息|\[表情|@\d+)", RegexOptions.Compiled);
 
     /// <summary>
     /// OneBot v11 的 raw_message 会把 CQ 特殊字符转义（`[`→&amp;#91;、`]`→&amp;#93;、`&amp;`→&amp;amp;、`,`→&amp;#44;）,
@@ -554,6 +562,13 @@ public class PayloadDefenseModule(
                     return Verdict.Real;
                 }
             }
+        }
+
+        // ③ 已知「可读化渲染差异」且内容对不上 ⇒ 放行（真消息被误报的主要根因就是这类差异）
+        if (RenderDeltaMarkerRegex.IsMatch(body))
+        {
+            reason = $"render-delta-allow qq={qq}";
+            return Verdict.Real;
         }
 
         reason = $"forged qq={qq} bufQq={bufQqCount} body={Truncate(body, 24)}";

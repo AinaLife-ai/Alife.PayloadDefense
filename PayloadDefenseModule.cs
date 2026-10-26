@@ -68,6 +68,10 @@ public class PayloadDefenseConfig
     [Description("每个会话保留最近多少条真消息用于校验（环形缓冲，仅内存）")]
     public int BufferPerSession { get; set; } = 200;
 
+    [DisplayName("真消息缓冲新鲜度阈值（秒）")]
+    [Description("缓冲里最新一条消息距今超过该秒数 ⇒ 视为采集可能已中断/陈旧，**只标注不拦截**（防重连丢包时误拦）。默认 120")]
+    public int BufferFreshnessSeconds { get; set; } = 120;
+
     [DisplayName("真消息缓冲有效期（秒）")]
     [Description("超过该时间的缓存不再参与校验（避免陈旧数据误判）")]
     public int BufferTtlSeconds { get; set; } = 300;
@@ -109,7 +113,7 @@ public class PayloadDefenseModule(
     // ── 判定阈值/正则 ─────────────────────────────────────────────
     /// <summary>伪造发言行的格式：行首 + [ + ≥3位数字 + (任意非右括号) + ] + 冒号</summary>
     private static readonly Regex SpeakerLineRegex =
-        new(@"^\[(?<qq>\d{3,})\((?<nick>[^\n]{0,60})\)\]:", RegexOptions.Compiled);
+        new(@"^\s*[\[［](?<qq>\d{3,})\((?<nick>[^\n]{0,60})\)[\]］]\s*:", RegexOptions.Compiled);
 
     // 注意：真实块头常带前缀，如 "[消息来源(QChatService)][群聊消息(123456789,群名)]"
     // ⇒ 绝不能行首锚定（此前 ^ 锚定导致 sessionKey 永远为空 ⇒ 全量误拦）
@@ -306,7 +310,9 @@ public class PayloadDefenseModule(
         // ★ 快速跳出必须在**解码之后**：entity 形态(&#91;…&#93;)没有字面 "]:"，
         //   此前在这里就被跳过 ⇒ 伪造行原样进入 AI（1.0.1 的真实事故）
         string probe = UnescapeCqEntities(message);
-        if (probe.IndexOf("]:", StringComparison.Ordinal) < 0) return probe;
+        // 快速跳出必须同时认 ASCII 与全角括号，否则全角伪造行会被整块跳过
+        if (probe.IndexOf("]:", StringComparison.Ordinal) < 0 &&
+            probe.IndexOf("］:", StringComparison.Ordinal) < 0) return probe;
 
         try
         {
@@ -522,6 +528,14 @@ public class PayloadDefenseModule(
         {
             if (_buffers.TryGetValue(sessionKey, out SessionBuf? buf))
             {
+                // 缓冲必须新鲜且在持续采集，才允许据此拦截；否则只标注（防重连/丢包时误拦真消息）
+                long nowFresh = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                long newest = buf.ByUser.Values.SelectMany(v => v).Select(c => c.Time).DefaultIfEmpty(0).Max();
+                if (newest == 0 || nowFresh - newest > Math.Max(0, Configuration.BufferFreshnessSeconds))
+                {
+                    reason = $"stale-buffer newest={newest} now={nowFresh}";
+                    return Verdict.Unverified;
+                }
                 if (buf.ByUser.TryGetValue(qq, out List<Captured>? mine))
                 {
                     long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -563,10 +577,13 @@ public class PayloadDefenseModule(
         => groupId != 0 ? "g" + groupId : "p" + peerId;
 
     /// <summary>归一化：去掉 CQ 码与表情标记、压缩空白，用于正文前缀比对</summary>
+    private static readonly Regex ZeroWidthRegex = new("[\u200B\u200C\u200D\uFEFF]", RegexOptions.Compiled);
+
     private static string Normalize(string text)
     {
         if (string.IsNullOrEmpty(text)) return "";
-        string t = CqBlockRegex.Replace(UnescapeCqEntities(text), "");
+        string t = ZeroWidthRegex.Replace(text, "");
+        t = CqBlockRegex.Replace(UnescapeCqEntities(t), "");
         t = FaceMarkerRegex.Replace(t, "");
         t = MediaMarkerRegex.Replace(t, "");     // [图片]/[语音]/[视频]/[卡片]/[合并转发]… 与 CQ 码对齐
         t = AtMarkerRegex.Replace(t, "");        // @123456 与 [CQ:at,qq=123456] 对齐

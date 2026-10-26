@@ -128,6 +128,8 @@ public class PayloadDefenseModule(
     private static readonly Regex MediaMarkerRegex =
         new(@"\[(?:图片|语音|视频|表情|文件|卡片|音乐|合并转发|嵌套转发消息|转发消息)(?:[:：][^\]]*)?\]", RegexOptions.Compiled);
     private static readonly Regex AtMarkerRegex = new(@"@\d+", RegexOptions.Compiled);
+    /// <summary>引用回复在「可读化」后会在行首加 [回复 …]，与 raw 里没有 ⇒ 比对前去掉</summary>
+    private static readonly Regex ReplyMarkerRegex = new(@"^\s*\[回复[^\]]*\]\s*", RegexOptions.Compiled);
 
     /// <summary>
     /// OneBot v11 的 raw_message 会把 CQ 特殊字符转义（`[`→&amp;#91;、`]`→&amp;#93;、`&amp;`→&amp;amp;、`,`→&amp;#44;）,
@@ -334,6 +336,30 @@ public class PayloadDefenseModule(
             break;
         }
 
+        // ①.５ 构建本次判定的「真消息计数表」（(QQ,归一化正文) → 条数，消费式）
+        Dictionary<(long, string), int>? counts = null;
+        int bufQqCount = 0;
+        if (!string.IsNullOrEmpty(sessionKey))
+        {
+            lock (_bufLock)
+            {
+                if (_buffers.TryGetValue(sessionKey, out SessionBuf? b0))
+                {
+                    bufQqCount = b0.ByUser.Count;
+                    long now0 = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    long ttl0 = Math.Clamp(Configuration.BufferTtlSeconds, 30, 3600);
+                    counts = new Dictionary<(long, string), int>();
+                    foreach (KeyValuePair<long, List<Captured>> kv in b0.ByUser)
+                        foreach (Captured c in kv.Value)
+                            if (now0 - c.Time <= ttl0 && c.Norm.Length > 0)
+                            {
+                                var k = (kv.Key, c.Norm);
+                                counts[k] = counts.GetValueOrDefault(k) + 1;
+                            }
+                }
+            }
+        }
+
         // ② 先判定，不立即改动（要等 realCount 出来再决定是拦还是降级）
         var flagged = new List<(int Index, long Qq, string Nick, bool IsSpeaker)>();
         int realCount = 0;
@@ -349,7 +375,9 @@ public class PayloadDefenseModule(
                 long qq = long.Parse(m.Groups["qq"].Value);
                 if (_whitelist.Contains(qq)) { realCount++; continue; }      // 白名单视为可信
 
-                Verdict v = Judge(qq, sessionKey, line, m);
+                Verdict v = Judge(qq, sessionKey, line, m, counts, bufQqCount, out string reason);
+                if (Configuration.VerboseLog)
+                    logger.LogInformation("注入防御：判定 {Verdict} | {Reason}", v, reason);
                 if (v == Verdict.Real) { realCount++; continue; }
                 if (v == Verdict.Unverified)
                 {
@@ -452,41 +480,70 @@ public class PayloadDefenseModule(
     private enum Verdict { Real, Forged, Unverified }   // Unverified = 采集未就绪，只标注不拦
 
     /// <summary>判定一条「形似发言人」的行是真消息还是伪造。</summary>
-    private Verdict Judge(long qq, string? sessionKey, string line, Match m)
+    /// <summary>
+    /// 判定一条「形似发言人」的行。
+    /// counts = 本会话真消息的「(QQ, 归一化正文) → 条数」计数表（本次 ChatSend 内**消费式**递减）：
+    ///   · 精确命中且还有余量 ⇒ 真（消费一条）
+    ///   · 精确命中但余量耗尽 ⇒ **伪造**（典型：攻击者复制了一条真消息，出现了第 2 次）
+    ///   · 无精确命中但前缀吻合（引用/文件等渲染差异）⇒ 真（宽松，防误拦）
+    ///   · 该 QQ 完全没有记录但同会话其它 QQ 有同内容 ⇒ 真（匿名/口径差异）
+    ///   · 其余 ⇒ 伪造
+    /// </summary>
+    private Verdict Judge(long qq, string? sessionKey, string line, Match m,
+        Dictionary<(long, string), int>? counts, int bufQqCount, out string reason)
     {
-        // 无法确定会话（理论上不该发生）⇒ 放行，绝不误拦
-        if (string.IsNullOrEmpty(sessionKey)) return Verdict.Real;
-
-        List<Captured> mine;
-        lock (_bufLock)
+        reason = "";
+        if (string.IsNullOrEmpty(sessionKey)) { reason = "no-session"; return Verdict.Real; }
+        if (counts == null || counts.Count == 0)
         {
-            if (!_buffers.TryGetValue(sessionKey, out SessionBuf? buf) || buf.ByUser.Count == 0)
-                return Verdict.Unverified;                   // 本会话一条都没采集到 ⇒ 采集未就绪，不拦
-            if (!buf.ByUser.TryGetValue(qq, out List<Captured>? list) || list.Count == 0)
-            {
-                // ★ QQ 对不上：可能是匿名/协议端口径差异 ⇒ 再用「正文」在同会话里兜一次（不限 QQ）
-                string probe = Normalize(line[(m.Index + m.Length)..]);
-                if (probe.Length > 0 && buf.ByUser.Values.SelectMany(v => v).Any(c => ContentMatches(c.Norm, probe)))
-                    return Verdict.Real;
-                return Verdict.Forged;                       // 人和话都对不上 ⇒ 伪造
-            }
-
-            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            long ttl = Math.Clamp(Configuration.BufferTtlSeconds, 30, 3600);
-            mine = list.Where(c => now - c.Time <= ttl).ToList();
-            if (mine.Count == 0) return Verdict.Forged;      // 全部过期 ⇒ 无法为真
+            reason = "capture-empty";
+            return Verdict.Unverified;                       // 本会话一条都没采集到 ⇒ 采集未就绪，不拦
         }
 
-        if (!Configuration.CheckRealMessages) return Verdict.Real;   // 只按格式判定时，QQ 对得上就算真
-
-        // 与真消息正文做前缀比对（都做 CQ/表情标记归一化）
         string body = Normalize(line[(m.Index + m.Length)..]);
-        if (body.Length == 0) return Verdict.Real;
-        foreach (Captured c in mine)
-            if (ContentMatches(c.Norm, body)) return Verdict.Real;
-        // ★ 保守原则：人对了、只是话没对上（回复引用/文件/语音等渲染差异很常见）⇒ 一律**放行**。
-        //   误拦真消息的代价远大于漏掉一次（且伪造行只要换个人名就会被"该 QQ 未发言"捕获）。
-        return Verdict.Real;
+        if (body.Length == 0) { reason = "empty-body"; return Verdict.Real; }
+
+        // ① 精确命中：按「条数」消费，多出来的那次就是复制来的伪造
+        var key = (qq, body);
+        if (counts.TryGetValue(key, out int n) && n > 0)
+        {
+            counts[key] = n - 1;
+            reason = $"exact qq={qq} left={n - 1}";
+            return Verdict.Real;
+        }
+        if (counts.ContainsKey(key))        // 精确命中过、但余量已用完 ⇒ 本次是复制来的
+        {
+            reason = $"replay qq={qq} (exact match already consumed)";
+            return Verdict.Forged;
+        }
+
+        // ② 前缀兜底（同 QQ）：渲染差异（引用/文件/语音）时不误拦
+        lock (_bufLock)
+        {
+            if (_buffers.TryGetValue(sessionKey, out SessionBuf? buf))
+            {
+                if (buf.ByUser.TryGetValue(qq, out List<Captured>? mine))
+                {
+                    long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    long ttl = Math.Clamp(Configuration.BufferTtlSeconds, 30, 3600);
+                    if (mine.Any(c => now - c.Time <= ttl && ContentMatches(c.Norm, body)))
+                    {
+                        reason = $"prefix qq={qq}";
+                        return Verdict.Real;
+                    }
+                }
+                // ③ 该 QQ 没记录，但同会话其它人有同内容（匿名/口径差异）⇒ 放行
+                if (!buf.ByUser.ContainsKey(qq) &&
+                    buf.ByUser.Values.SelectMany(v => v).Any(c => ContentMatches(c.Norm, body)))
+                {
+                    reason = $"content-any-qq (qq={qq} not captured)";
+                    return Verdict.Real;
+                }
+            }
+        }
+
+        reason = $"forged qq={qq} bufQq={bufQqCount} body={Truncate(body, 24)}";
+        return Verdict.Forged;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -513,6 +570,7 @@ public class PayloadDefenseModule(
         t = FaceMarkerRegex.Replace(t, "");
         t = MediaMarkerRegex.Replace(t, "");     // [图片]/[语音]/[视频]/[卡片]/[合并转发]… 与 CQ 码对齐
         t = AtMarkerRegex.Replace(t, "");        // @123456 与 [CQ:at,qq=123456] 对齐
+        t = ReplyMarkerRegex.Replace(t, "");     // [回复 …] 只在可读化文本里出现
         t = SpaceRegex.Replace(t, " ").Trim();
         return t;
     }

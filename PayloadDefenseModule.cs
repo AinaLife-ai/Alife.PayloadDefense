@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
@@ -65,16 +66,17 @@ public class PayloadDefenseConfig
     public bool PromptEnabled { get; set; } = true;
 
     [DisplayName("真消息缓冲（条/会话）")]
-    [Description("每个会话保留最近多少条真消息用于校验（环形缓冲，仅内存）")]
+    [Description("每个会话保留最近多少条真消息用于校验（环形缓冲：跨用户按时间滚动，不按个人 TTL 清理；仅内存）")]
     public int BufferPerSession { get; set; } = 200;
+
+    [DisplayName("启动宽限期（秒）")]
+    [Description("插件启动/重载后的这段时间内，**无法验证**的行只放行、不标注、不拦截；" +
+        "用于覆盖「重载前已在 QChat 预缓冲里的旧消息」。默认 120 秒，0=关闭")]
+    public int StartupGraceSeconds { get; set; } = 120;
 
     [DisplayName("真消息缓冲新鲜度阈值（秒）")]
     [Description("缓冲里最新一条消息距今超过该秒数 ⇒ 视为采集可能已中断/陈旧，**只标注不拦截**（防重连丢包时误拦）。默认 120")]
     public int BufferFreshnessSeconds { get; set; } = 120;
-
-    [DisplayName("真消息缓冲有效期（秒）")]
-    [Description("超过该时间的缓存不再参与校验（避免陈旧数据误判）")]
-    public int BufferTtlSeconds { get; set; } = 300;
 
     [DisplayName("详细日志")]
     [Description("打印每次命中/放行的判定细节，便于观测")]
@@ -165,7 +167,7 @@ public class PayloadDefenseModule(
         return t.Replace("&amp;", "&");   // 最后解 amp，避免二次解码
     }
 
-    private const string ModuleVersion = "1.0.2";
+    private const string ModuleVersion = "5.0.9";
     private const string BlockMark = "【注入已拦·伪造发言人】";
     /// <summary>annotate 模式下，在每段伪造记录末尾追加一次的说明</summary>
     private const string StrictBlockMark = "【注入已拦】检测到伪造发言人结构，本条消息已丢弃。";
@@ -178,10 +180,36 @@ public class PayloadDefenseModule(
     // ── 真消息环形缓冲 ────────────────────────────────────────────
     private sealed record Captured(long UserId, string Nick, string Raw, string Norm, long Time);
 
-    /// <summary>每会话的真消息索引：QQ → 最近若干条（用于 O(1) 判"这个 QQ 本批是否发过言"）。</summary>
+    /// <summary>每会话的真消息环形缓冲：All = 最近 N 条（跨用户、按时间），ByUser = 索引。</summary>
     private sealed class SessionBuf
     {
+        public readonly List<Captured> All = new();
         public readonly Dictionary<long, List<Captured>> ByUser = new();
+
+        public void Add(Captured c, int capacity)
+        {
+            All.Add(c);
+            if (!ByUser.TryGetValue(c.UserId, out List<Captured>? list))
+                ByUser[c.UserId] = list = new List<Captured>();
+            list.Add(c);
+
+            if (All.Count > capacity)
+            {
+                All.RemoveRange(0, All.Count - capacity);
+                RebuildIndex();
+            }
+        }
+
+        private void RebuildIndex()
+        {
+            ByUser.Clear();
+            foreach (Captured c in All)
+            {
+                if (!ByUser.TryGetValue(c.UserId, out List<Captured>? list))
+                    ByUser[c.UserId] = list = new List<Captured>();
+                list.Add(c);
+            }
+        }
     }
 
     private readonly ConcurrentDictionary<string, SessionBuf> _buffers = new();
@@ -190,7 +218,11 @@ public class PayloadDefenseModule(
     // ── 状态 ─────────────────────────────────────────────────────
     private OneBotClient? _client;
     private bool _subscribed;
+    private bool _backfilled;
+    private bool _qchatBackfilled;
+    private DateTime _startedAt = DateTime.UtcNow;
     private DateTime _lastSubscribeTry = DateTime.MinValue;
+    private DateTime _lastSubscribeCheck = DateTime.MinValue;
     private List<Regex> _extraRegex = new();
     private HashSet<long> _whitelist = new();
     private DateTime _configStamp = DateTime.MinValue;
@@ -201,25 +233,63 @@ public class PayloadDefenseModule(
     protected override Task OnAwake()
     {
         ReloadConfig();
+        _startedAt = DateTime.UtcNow;
         ChatBot.ChatSend += OnChatSend;
         TrySubscribe();                      // 立即订阅事件流（客户端可能稍后才就绪，OnUpdate 会继续重试）
+        _qchatBackfilled = BackfillFromQChatBuffers() > 0;   // 重载前已在 QChat 预缓冲里的消息，事件订阅不到，直接回填
 
         if (Configuration.PromptEnabled)
             interactor.Prompt(PromptLine);   // 只注入一次 ⇒ 前缀稳定，利于缓存
 
-        logger.LogInformation("注入防御 v{Ver} 已启用：mode={Mode} 真消息校验={Check} 缓冲={N}条/{Ttl}s",
+        logger.LogInformation("注入防御 v{Ver} 已启用：mode={Mode} 真消息校验={Check} 缓冲=最近{N}条/会话",
             ModuleVersion,
             Configuration.Mode, Configuration.CheckRealMessages,
-            Configuration.BufferPerSession, Configuration.BufferTtlSeconds);
+            Configuration.BufferPerSession);
+        return Task.CompletedTask;
+    }
+
+    protected override Task OnStart()
+    {
+        if (!_qchatBackfilled)
+        {
+            BackfillFromQChatBuffers();
+            _qchatBackfilled = true;
+        }
         return Task.CompletedTask;
     }
 
     protected override Task OnUpdate()
     {
         // 客户端可能因重连被重建 ⇒ 周期性确保订阅（每秒最多尝试一次，开销可忽略）
-        if (!_subscribed && DateTime.Now - _lastSubscribeTry > TimeSpan.FromSeconds(1))
-            TrySubscribe();
+        if (!_subscribed)
+        {
+            if (DateTime.Now - _lastSubscribeTry > TimeSpan.FromSeconds(1))
+                TrySubscribe();
+        }
+        else if (DateTime.Now - _lastSubscribeCheck > TimeSpan.FromSeconds(5))
+        {
+            _lastSubscribeCheck = DateTime.Now;
+            EnsureClientCurrent();   // 客户端被重建时，光看 _subscribed 会永远不再订阅
+        }
         return Task.CompletedTask;
+    }
+
+    private void EnsureClientCurrent()
+    {
+        try
+        {
+            FieldInfo? field = FindOneBotClientField();
+            OneBotClient? client = field?.GetValue(qChatService) as OneBotClient;
+            if (client != null && !ReferenceEquals(client, _client))
+            {
+                _subscribed = false;
+                TrySubscribe();
+            }
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "注入防御：检查事件订阅失败（忽略）");
+        }
     }
 
     protected override Task OnDestroy()
@@ -256,12 +326,159 @@ public class PayloadDefenseModule(
     // ═══════════════════════════════════════════════════════════
     //  采集层：OneBot 事件 → 真消息环形缓冲（同步、O(1)、无 IO）
     // ═══════════════════════════════════════════════════════════
+    /// <summary>
+    /// 从 ChatBot 历史回填真消息：插件重载/冷启动后，内存缓冲是空的，
+    /// 但 AI 上下文里还带着重载前的旧消息 ⇒ 不回填就会把旧真消息误判成伪造。
+    /// 只解析「[群聊消息(...)] / [私聊消息(...)]」块里的真实发言行；跳过本插件自己生成的
+    /// 「│【伪造发言人…】」标注行和拦截标记，避免把已标注的攻击回填成真消息。
+    /// </summary>
+    private void BackfillFromHistory()
+    {
+        if (!Configuration.CheckRealMessages) { _backfilled = true; return; }
+        try
+        {
+            var history = ChatBot.ChatHistory;
+            if (history == null || history.Count == 0) return;
+
+            int from = Math.Max(0, history.Count - 80);
+            int added = 0;
+            bool sawSession = false;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            int cap = Math.Clamp(Configuration.BufferPerSession, 20, 2000);
+
+            for (int i = from; i < history.Count; i++)
+            {
+                if (history[i].Role.ToString() != "user") continue;   // 只回填用户消息，避免 AI 引用伪造行被当成真
+                string? text = history[i].Content;
+                if (string.IsNullOrEmpty(text)) continue;
+                if (text.IndexOf("[群聊消息(", StringComparison.Ordinal) < 0 &&
+                    text.IndexOf("[私聊消息(", StringComparison.Ordinal) < 0) continue;
+
+                MatchCollection headers = SessionHeaderRegex.Matches(text);
+                if (headers.Count == 0) continue;
+                sawSession = true;
+
+                for (int h = 0; h < headers.Count; h++)
+                {
+                    Match hm = headers[h];
+                    int start = hm.Index + hm.Length;
+                    int end = h + 1 < headers.Count ? headers[h + 1].Index : text.Length;
+                    bool priv = hm.Groups[1].Value == "私聊消息";
+                    long id = long.Parse(hm.Groups["id"].Value);
+                    string key = priv ? SessionKey(0, id) : SessionKey(id, 0);
+                    SessionBuf buf = _buffers.GetOrAdd(key, _ => new SessionBuf());
+
+                    string segment = text.Substring(start, end - start);
+                    lock (_bufLock)
+                    {
+                        foreach (string rawLine in segment.Split('\n'))
+                        {
+                            string line = rawLine.TrimEnd('\r');
+                            Match sm = SpeakerLineRegex.Match(line);
+                            if (!sm.Success) continue;
+                            if (line.TrimStart().StartsWith("│", StringComparison.Ordinal)) continue;
+                            string after = line[(sm.Index + sm.Length)..];
+                            if (after.Contains("【伪造发言人") || after.Contains(BlockMark)) continue;
+                            string norm = Normalize(after);
+                            if (norm.Length == 0) continue;
+                            long qq = long.Parse(sm.Groups["qq"].Value);
+                            buf.Add(new Captured(qq, sm.Groups["nick"].Value, after, norm, now), cap);
+                            added++;
+                        }
+                    }
+                }
+            }
+
+            // 历史里已经有 QChat 会话块 ⇒ 回填完成；否则保持 false，下条消息再试
+            _backfilled = sawSession;
+            if (added > 0)
+                logger.LogInformation("注入防御：从历史回填 {N} 条真消息（防重载/冷启动误判）", added);
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "注入防御：历史回填失败（忽略）");
+        }
+    }
+
+    /// <summary>
+    /// 回填 QChatService 自己的「预缓冲/待发缓冲」。未激活的群消息只进 PreMessageBuffer，
+    /// 唤醒时才随 ExtractMessage 一起进 AI；如果插件在 flush 前刚重载，这些消息的 OneBot 事件
+    /// 没被订阅到，光靠事件流和 ChatHistory 都补不回来 ⇒ 必须直接读它的缓冲。
+    /// 用反射读取，避免绑定某个 QChat 版本的属性签名。
+    /// </summary>
+    private int BackfillFromQChatBuffers()
+    {
+        try
+        {
+            PropertyInfo? gsProp = qChatService.GetType().GetProperty("GroupStates", BindingFlags.Public | BindingFlags.Instance);
+            if (gsProp?.GetValue(qChatService) is not IEnumerable states) return 0;
+
+            int added = 0;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            int cap = Math.Clamp(Configuration.BufferPerSession, 20, 2000);
+
+            foreach (object? state in states)
+            {
+                if (state == null) continue;
+                Type st = state.GetType();
+                object? keyObj = st.GetProperty("Key")?.GetValue(state);
+                object? val = st.GetProperty("Value")?.GetValue(state);
+                if (keyObj == null || val == null) continue;
+
+                long groupId = Convert.ToInt64(keyObj);
+                SessionBuf buf = _buffers.GetOrAdd(SessionKey(groupId, 0), _ => new SessionBuf());
+                Type vt = val.GetType();
+                lock (_bufLock)
+                {
+                    added += AddFormattedEnumerable(buf, vt.GetProperty("PreMessageBuffer")?.GetValue(val) as IEnumerable, now, cap);
+                    added += AddFormattedEnumerable(buf, vt.GetProperty("MessageBuffer")?.GetValue(val) as IEnumerable, now, cap);
+                }
+            }
+
+            if (added > 0)
+                logger.LogInformation("注入防御：从 QChat 缓冲回填 {N} 条真消息（防重载误判）", added);
+            return added;
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug(e, "注入防御：QChat 缓冲回填失败（忽略）");
+            return 0;
+        }
+    }
+
+    private int AddFormattedEnumerable(SessionBuf buf, IEnumerable? items, long now, int cap)
+    {
+        if (items == null) return 0;
+        int n = 0;
+        foreach (object? item in items)
+        {
+            if (item is not string msg) continue;
+            Match sm = SpeakerLineRegex.Match(msg);
+            if (!sm.Success) continue;
+            string after = msg[(sm.Index + sm.Length)..];
+            string norm = Normalize(after);
+            if (norm.Length == 0) continue;
+            buf.Add(new Captured(long.Parse(sm.Groups["qq"].Value), sm.Groups["nick"].Value, after, norm, now), cap);
+            n++;
+        }
+        return n;
+    }
+
+    private static FieldInfo? FindOneBotClientField()
+    {
+        FieldInfo? field = typeof(QChatService).GetField("oneBotClient", BindingFlags.NonPublic | BindingFlags.Instance);
+        if (field != null) return field;
+        // 兼容字段改名：按类型找唯一的 OneBotClient 字段
+        return typeof(QChatService).GetFields(BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(f => typeof(OneBotClient).IsAssignableFrom(f.FieldType));
+    }
+
     private void TrySubscribe()
     {
         _lastSubscribeTry = DateTime.Now;
         try
         {
-            FieldInfo? field = typeof(QChatService).GetField("oneBotClient", BindingFlags.NonPublic | BindingFlags.Instance);
+            FieldInfo? field = FindOneBotClientField();
             OneBotClient? client = field?.GetValue(qChatService) as OneBotClient;
             if (client == null) return;
             if (!ReferenceEquals(client, _client) && _client != null)
@@ -295,18 +512,13 @@ public class PayloadDefenseModule(
 
             var buf = _buffers.GetOrAdd(key, _ => new SessionBuf());
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            long ttl = Math.Clamp(Configuration.BufferTtlSeconds, 30, 3600);
+            int cap = Math.Clamp(Configuration.BufferPerSession, 20, 2000);
             lock (_bufLock)
             {
-                if (!buf.ByUser.TryGetValue(msg.UserId, out var list))
-                    buf.ByUser[msg.UserId] = list = new List<Captured>();
-                list.Add(new Captured(msg.UserId, nick, raw, Normalize(raw), now));
-                int perQq = Math.Clamp(Configuration.BufferPerSession / 10, 10, 50);   // 每人保留最近 N 条
-                if (list.Count > perQq) list.RemoveRange(0, list.Count - perQq);
-                // 顺带清理过期条目，避免长期占用
-                foreach (long u in buf.ByUser.Where(kv => kv.Value.Count > 0 && now - kv.Value[^1].Time > ttl)
-                                             .Select(kv => kv.Key).ToList())
-                    buf.ByUser.Remove(u);
+                // 关键：按「会话最近 N 条」滚动保留，不按单个人最后发言时间做 TTL 清理。
+                // 否则一个 5 分钟前说过一句、之后没再说话的人会被整条清掉，
+                // 而 AI 上下文里还带着那句真消息 ⇒ 被误判成伪造（本次真实误报的根因）。
+                buf.Add(new Captured(msg.UserId, nick, raw, Normalize(raw), now), cap);
             }
         }
         catch (Exception ex)
@@ -321,6 +533,7 @@ public class PayloadDefenseModule(
     private string OnChatSend(string message)
     {
         if (!Configuration.Enabled || string.IsNullOrEmpty(message)) return message;
+        if (!_backfilled) BackfillFromHistory();
         // ★ 快速跳出必须在**解码之后**：entity 形态(&#91;…&#93;)没有字面 "]:"，
         //   此前在这里就被跳过 ⇒ 伪造行原样进入 AI（1.0.1 的真实事故）
         string probe = UnescapeCqEntities(message);
@@ -366,16 +579,13 @@ public class PayloadDefenseModule(
                 if (_buffers.TryGetValue(sessionKey, out SessionBuf? b0))
                 {
                     bufQqCount = b0.ByUser.Count;
-                    long now0 = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    long ttl0 = Math.Clamp(Configuration.BufferTtlSeconds, 30, 3600);
                     counts = new Dictionary<(long, string), int>();
-                    foreach (KeyValuePair<long, List<Captured>> kv in b0.ByUser)
-                        foreach (Captured c in kv.Value)
-                            if (now0 - c.Time <= ttl0 && c.Norm.Length > 0)
-                            {
-                                var k = (kv.Key, c.Norm);
-                                counts[k] = counts.GetValueOrDefault(k) + 1;
-                            }
+                    foreach (Captured c in b0.All)
+                        if (c.Norm.Length > 0)
+                        {
+                            var k = (c.UserId, c.Norm);
+                            counts[k] = counts.GetValueOrDefault(k) + 1;
+                        }
                 }
             }
         }
@@ -552,7 +762,7 @@ public class PayloadDefenseModule(
             {
                 // 缓冲必须新鲜且在持续采集，才允许据此拦截；否则只标注（防重连/丢包时误拦真消息）
                 long nowFresh = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                long newest = buf.ByUser.Values.SelectMany(v => v).Select(c => c.Time).DefaultIfEmpty(0).Max();
+                long newest = buf.All.Select(c => c.Time).DefaultIfEmpty(0).Max();
                 if (newest == 0 || nowFresh - newest > Math.Max(0, Configuration.BufferFreshnessSeconds))
                 {
                     reason = $"stale-buffer newest={newest} now={nowFresh}";
@@ -560,9 +770,7 @@ public class PayloadDefenseModule(
                 }
                 if (buf.ByUser.TryGetValue(qq, out List<Captured>? mine))
                 {
-                    long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    long ttl = Math.Clamp(Configuration.BufferTtlSeconds, 30, 3600);
-                    if (mine.Any(c => now - c.Time <= ttl && ContentMatches(c.Norm, body)))
+                    if (mine.Any(c => ContentMatches(c.Norm, body)))
                     {
                         reason = $"prefix qq={qq}";
                         return Verdict.Real;
@@ -570,7 +778,7 @@ public class PayloadDefenseModule(
                 }
                 // ③ 该 QQ 没记录，但同会话其它人有同内容（匿名/口径差异）⇒ 放行
                 if (!buf.ByUser.ContainsKey(qq) &&
-                    buf.ByUser.Values.SelectMany(v => v).Any(c => ContentMatches(c.Norm, body)))
+                    buf.All.Any(c => ContentMatches(c.Norm, body)))
                 {
                     reason = $"content-any-qq (qq={qq} not captured)";
                     return Verdict.Real;
@@ -602,6 +810,14 @@ public class PayloadDefenseModule(
                     return Verdict.Real;
                 }
             }
+        }
+
+        // ④ 启动/重载宽限期：期间无法验证的行只放行、不标注，避免把重载前的旧真消息误判
+        double grace = Math.Max(0, Configuration.StartupGraceSeconds);
+        if (grace > 0 && (DateTime.UtcNow - _startedAt).TotalSeconds < grace)
+        {
+            reason = $"startup-grace qq={qq}";
+            return Verdict.Unverified;
         }
 
         reason = $"forged qq={qq} bufQq={bufQqCount} body={Truncate(body, 24)}";

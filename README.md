@@ -71,6 +71,14 @@ BufferGroupMessage(messageSource, $"{speaker}:{content}");   // → "[123456789(
 <details>
 <summary>点开查看历史版本（默认折叠）</summary>
 
+### 5.0.12（2026-11-23）
+
+**采集口径不可靠时 fail-open（进一步降低误伤）**
+
+- OneBot 极少数适配器会给空的 `raw_message`、只给 `Message` JSON；QChat 能自己还原内容，但本插件拿不到同口径原文。此时标记采集缺口，后续 **5 分钟对所有会话 fail-open**（只放行、不标注/不拦截），宁可漏拦也不误伤。
+- 只有 `raw_message` 为空且 `Message` 确实有内容时才触发；真正的空消息不会触发，避免被恶意空消息利用。
+- 验证：防注入真值 **45/45**；真实 QChat 事件/回填 **4/4** + 可读化归一 **6/6**；无 QChat 编译 0 error。
+
 ### 5.0.11（2026-11-23）
 
 **误伤回归修正（相对 5.0.10）**

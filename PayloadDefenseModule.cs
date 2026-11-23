@@ -115,6 +115,7 @@ public class PayloadDefenseModule(
     private Type? _qChatType;
     private DateTime _lastQChatResolve = DateTime.MinValue;
     private bool _qchatUnavailableLogged;
+    private long _captureGapUntilUnix;
 
     private PayloadDefenseConfig _configuration = new();
     public PayloadDefenseConfig Configuration
@@ -171,7 +172,7 @@ public class PayloadDefenseModule(
         return t.Replace("&amp;", "&");   // 最后解 amp，避免二次解码
     }
 
-    private const string ModuleVersion = "5.0.11";
+    private const string ModuleVersion = "5.0.12";
     private const string BlockMark = "【注入已拦·伪造发言人】";
     // 常驻提示只做「辅助定调」：真正起作用的是行内标注（离内容最近）。
     // 保持静态 ⇒ 不破坏提示词前缀缓存；长度控制在 ~50 token。
@@ -462,6 +463,19 @@ public class PayloadDefenseModule(
     }
 
     /// <summary>
+    /// OneBot 极少数适配器会给出空 raw_message（只给 Message JSON）。QChat 自己还能从 JSON
+    /// 还原内容，但本插件拿不到同口径原文 ⇒ 采集不可靠。此时对后续 5 分钟一律 fail-open，
+    /// 宁可漏拦也不把真实消息误判成伪造。
+    /// </summary>
+    private void MarkCaptureGap()
+    {
+        long until = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds();
+        if (until > Interlocked.Read(ref _captureGapUntilUnix))
+            Interlocked.Exchange(ref _captureGapUntilUnix, until);
+        logger.LogDebug("注入防御：检测到空 raw_message，采集暂不可靠，后续 5 分钟 fail-open");
+    }
+
+    /// <summary>
     /// 回填 QChatService 自己的「预缓冲/待发缓冲」。未激活的群消息只进 PreMessageBuffer，
     /// 唤醒时才随 ExtractMessage 一起进 AI；如果插件在 flush 前刚重载，这些消息的 OneBot 事件
     /// 没被订阅到，光靠事件流和 ChatHistory 都补不回来 ⇒ 必须直接读它的缓冲。
@@ -667,6 +681,16 @@ public class PayloadDefenseModule(
 
             long groupId = Convert.ToInt64(type.GetProperty("GroupId", BindingFlags.Public | BindingFlags.Instance)?.GetValue(e) ?? 0L);
             string raw = rawProp.GetValue(e) as string ?? "";
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                // 只有「raw 为空但 Message 里确实有内容」（适配器没给 raw_message）才算采集缺口；
+                // 真正的空消息不应因此让防御 5 分钟 fail-open，避免被恶意空消息利用。
+                object? messageObj = type.GetProperty("Message", BindingFlags.Public | BindingFlags.Instance)?.GetValue(e);
+                string payload = messageObj?.ToString() ?? "";
+                if (!string.IsNullOrWhiteSpace(payload) && payload != "[]" && payload != "null")
+                    MarkCaptureGap();
+                return;
+            }
             string key = SessionKey(groupId, groupId == 0 ? userId : 0);
 
             var buf = _buffers.GetOrAdd(key, _ => new SessionBuf());
@@ -921,6 +945,11 @@ public class PayloadDefenseModule(
         {
             reason = "format-only";
             return Verdict.Forged;   // 用户显式关闭真消息校验：只按格式判定（会误伤，仅供排查）
+        }
+        if (DateTimeOffset.UtcNow.ToUnixTimeSeconds() < Interlocked.Read(ref _captureGapUntilUnix))
+        {
+            reason = "capture-gap-fail-open";
+            return Verdict.Unverified;   // 采集口径不可靠时宁可漏拦，不误伤
         }
         if (counts == null || counts.Count == 0)
         {

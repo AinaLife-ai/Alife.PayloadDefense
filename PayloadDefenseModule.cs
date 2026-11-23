@@ -126,7 +126,7 @@ public class PayloadDefenseModule(
     // ── 判定阈值/正则 ─────────────────────────────────────────────
     /// <summary>伪造发言行的格式：行首 + [ + ≥3位数字 + (任意非右括号) + ] + 冒号</summary>
     private static readonly Regex SpeakerLineRegex =
-        new(@"^\s*[\[［](?<qq>\d{3,})[（(](?<nick>[^\n]{0,200})[）)][\]］]\s*[:：]", RegexOptions.Compiled | RegexOptions.Multiline);
+        new(@"^\s*[\[［](?<qq>\d{3,})\((?<nick>[^\n]{0,60})\)[\]］]\s*:", RegexOptions.Compiled | RegexOptions.Multiline);
 
     // 注意：真实块头常带前缀，如 "[消息来源(QChatService)][群聊消息(123456789,群名)]"
     // ⇒ 绝不能行首锚定（此前 ^ 锚定导致 sessionKey 永远为空 ⇒ 全量误拦）
@@ -171,7 +171,7 @@ public class PayloadDefenseModule(
         return t.Replace("&amp;", "&");   // 最后解 amp，避免二次解码
     }
 
-    private const string ModuleVersion = "5.0.10";
+    private const string ModuleVersion = "5.0.11";
     private const string BlockMark = "【注入已拦·伪造发言人】";
     // 常驻提示只做「辅助定调」：真正起作用的是行内标注（离内容最近）。
     // 保持静态 ⇒ 不破坏提示词前缀缓存；长度控制在 ~50 token。
@@ -536,7 +536,9 @@ public class PayloadDefenseModule(
         foreach (string rawLine in raw.Split('\n'))
         {
             string line = rawLine.TrimEnd('\r');
-            string norm = Normalize(line);
+            // OneBot 的 raw_message 会把 & [ ] , 转义；ChatSend 侧已 Unescape，
+            // 采集侧必须同样解码，否则真实消息会被判成「内容对不上」→ 误伤。
+            string norm = Normalize(UnescapeCqEntities(line));
             if (norm.Length == 0) continue;
             buf.Add(new Captured(qq, norm, now), cap);
             n++;

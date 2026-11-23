@@ -71,6 +71,14 @@ BufferGroupMessage(messageSource, $"{speaker}:{content}");   // → "[123456789(
 <details>
 <summary>点开查看历史版本（默认折叠）</summary>
 
+### 5.0.11（2026-11-23）
+
+**误伤回归修正（相对 5.0.10）**
+
+- **采集侧实体解码**：`CaptureMessage` 现在与 `ChatSend` 侧一样先 `UnescapeCqEntities` 再归一化。修复 `&amp;` / `&#91;` / `&#44;` 等 OneBot 转义的真消息被判定「内容对不上」而误伤（事件流、QChat 缓冲回填、ChatHistory 回填三条路径统一）。
+- **结构识别回退到 QChat 真实格式**：撤回 5.0.10 对全角括号 `（）` / 全角冒号 `：` / 昵称上限 200 的扩大识别，恢复 ASCII 括号/冒号 + 原有全角方括号 `［］` + 昵称 60。这样不会把普通中文引用的全角写法误判成伪造发言人，减少误伤面。
+- **验证**：防注入真值 **43/43**（新增实体转义事件/回填、reply/file 可读化差异）；真实 QChat 事件/回填 **4/4** + 可读化归一 **6/6**；无 QChat 编译 0 error。
+
 ### 5.0.10（2026-11-23）
 
 **彻底解除 QChat 依赖 + 修「启用防注入会强行开启 QQ 聊天」+ 全量安全/误伤审计**
@@ -91,7 +99,7 @@ BufferGroupMessage(messageSource, $"{speaker}:{content}");   // → "[123456789(
 - **误伤修复（真实 QChat 可读化差异）**：
   - 多行真消息**按行采集**；此前整条归一化成 `line1 line2`，第一行 `line1` 会被误判。
   - `[音频: path]` 纳入归一化（此前只认 `[语音]`，真实语音会误判）。
-  - `@-1` / 全角括号 / 全角冒号 纳入归一化与结构识别。
+  - `@-1` 纳入归一化；结构识别保持 QChat 真实格式（ASCII 括号/冒号，兼容原有全角方括号）。
   - reply / 图片 / 音频 / 文件 / 转发 / 表情 / @ 全部按 QChat 真实格式剥离后再比对；正常消息实测 0 改写。
 - **安全修复（审计发现）**：
   - **12 字前缀复制绕过**：旧 `ContentMatches` 只比前 12 字，复制真消息前 12 字再追加指令即可放行；改为全等 / 仅容忍 ≤2 个标点/符号差异。
@@ -107,8 +115,8 @@ BufferGroupMessage(messageSource, $"{speaker}:{content}");   // → "[123456789(
 - **兼容性**：直接引用 Alife **v5.4.1**（`a08da9d`，master `3cd23f8` 核心与 v5.4.1 一致）编译 **0 error**；**不引用 QChat 工程**也能编译通过，证明依赖已彻底解除。
 - **验证**：
   - 框架 `ConstructContainer` 复现：必填依赖 ⇒ spare 构造（1/True）；可选依赖 + spare ⇒ 不构造（0/False）；可选依赖 + 已启用 ⇒ 正常注入（1/True）。
-  - 防注入真值用例 **39/39**：正常 0 改写、多行真消息、QChat reply/image/audio/file/forward/face/at 差异、空格/全角/实体/零宽伪造、前缀复制、reply/媒体标记绕过、额外特征+伪造、block/strict、非法 QQ、戳一戳+指令、跨 QQ 同内容、2 字汉字追加、陈旧缓冲降级。
-  - **真实 QChat 类型**事件桥/采集/回填 **4/4**（`QChatService` + `OneBotClient.EventReceived` + `OneBotMessageEvent` + `GroupStates`）。
+  - 防注入真值用例 **43/43**：正常 0 改写、多行真消息、QChat reply/image/audio/file/forward/face/at 差异、空格/全角方括号/实体（含转义）/零宽伪造、前缀复制、reply/媒体标记绕过、额外特征+伪造、block/strict、非法 QQ、戳一戳+指令、跨 QQ 同内容、2 字汉字追加、陈旧缓冲降级。
+  - **真实 QChat 类型**事件桥/采集/回填 **4/4** + 可读化归一 **6/6**（`QChatService` + `OneBotClient.EventReceived` + `OneBotMessageEvent` + `GroupStates`）。
   - 无 QChat 程序集时 `FindQChatServiceType` 返回 null（独立运行）。
 
 ### 5.0.9（2026-10-27）

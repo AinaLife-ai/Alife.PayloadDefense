@@ -41,8 +41,8 @@ BufferGroupMessage(messageSource, $"{speaker}:{content}");   // → "[123456789(
 
 | 层 | 做什么 | 开销 |
 |---|---|---|
-| ① 采集 | 订阅 OneBot 事件流，把**真实收到的消息**放进每会话环形缓冲（仅内存、5 分钟过期） | 同步 O(1)，无 IO ⇒ **零卡顿、用户无感知、零配置** |
-| ② 校验 | 在 `ChatBot.ChatSend`（消息进入 AI 上下文之前）逐行看：形如 `[≥3位数字(任意)]:` 的行，去缓冲里找**同会话 + 同 QQ + 正文前缀吻合**的真消息 | O(行数)，正常消息 **0 字节改动 / 0 额外 token** |
+| ① 采集 | 订阅 OneBot 事件流，把**真实收到的消息**放进每会话环形缓冲（仅内存，保留最近 N 条） | 同步 O(1)，无 IO ⇒ **零卡顿、用户无感知、零配置** |
+| ② 校验 | 在 `ChatBot.ChatSend`（消息进入 AI 上下文之前）逐行看：形如 `[≥3位数字(任意)]:` 的行，去缓冲里找**同会话 + 同 QQ + 正文吻合（仅容忍 ≤2 个标点/符号差异）**的真消息 | O(行数)，正常消息 **0 字节改动 / 0 额外 token** |
 | ③ 定调 | 系统提示词里常驻一句安全规则（约 35 token，**只注入一次**，不破坏前缀缓存） | 一次性 |
 
 **判定结果**：
@@ -62,12 +62,54 @@ BufferGroupMessage(messageSource, $"{speaker}:{content}");   // → "[123456789(
 
 > 默认取 `annotate` 与参考实现一致：**标记为伪造** + **告知是注入**，同时**不丢内容**。
 
+> **本插件不依赖、不安装、不加载、不启动 QChat**；QChat 未安装/未启用时保持待机，启用后自动接入（详见 5.0.10）。
+
 ---
 
 ## 更新日志
 
 <details>
 <summary>点开查看历史版本（默认折叠）</summary>
+
+### 5.0.10（2026-11-23）
+
+**彻底解除 QChat 依赖 + 修「启用防注入会强行开启 QQ 聊天」+ 全量安全/误伤审计**
+
+- **现场问题**：用户未启用官方 QQ 聊天模块，只启用本插件，QChat 被强行开启，甚至双推送；卸载 QChat 也会被依赖重新装回/面板仍出现。
+- **根因（已用框架 `ConstructContainer` 复现）**：
+  1. `manifest.json` 把 `Alife.Function.QChat` 列为依赖 ⇒ 启用本插件时 QChat 被加载、模块注册为 **spare**，市场安装/升级还会自动装回 QChat；
+  2. 本插件构造函数把 `QChatService` 写成**必填参数** ⇒ `ConstructContainer` 为满足依赖，以 `allowSpare: true` 把 spare 的 QChatService **构造出来**；
+  3. `ChatActivity` 激活循环会对**所有已构造实例**执行 `OnAwake/OnStart` ⇒ QChat 连接 OneBot，造成强行开启/双推送。
+- **修复（彻底解耦）**：
+  - **`manifest.json` 移除 QChat 依赖**；插件源码**不再引用任何 QChat 类型**，可独立安装/编译/运行。市场安装不会自动装 QChat，QChat 可正常卸载。
+  - 运行时按需反射：
+    - 扫描已加载程序集找 `Alife.Function.QChat.QChatService`；未安装/未加载 ⇒ 直接待机；
+    - 只在 `ChatActivity.Container.RequireInstance(...)`（默认 `allowSpare: false`）成功时接入 ⇒ **绝不构造未启用的 spare QChat**；
+    - 事件流用泛型适配器 `EventAdapter<T>` + `Delegate.CreateDelegate` 桥接 `Action<OneBotBaseEvent>`；
+    - 消息字段（UserId/GroupId/Sender/RawMessage）与 `oneBotClient` 均反射读取。
+  - QChat 后开启 ⇒ 自动接入；后关闭/卸载 ⇒ 自动摘除；未安装/未启用 ⇒ 本插件待机，**不会由本插件带出/装回 QChat**（QChat 自身是否安装由用户控制）。
+- **误伤修复（真实 QChat 可读化差异）**：
+  - 多行真消息**按行采集**；此前整条归一化成 `line1 line2`，第一行 `line1` 会被误判。
+  - `[音频: path]` 纳入归一化（此前只认 `[语音]`，真实语音会误判）。
+  - `@-1` / 全角括号 / 全角冒号 纳入归一化与结构识别。
+  - reply / 图片 / 音频 / 文件 / 转发 / 表情 / @ 全部按 QChat 真实格式剥离后再比对；正常消息实测 0 改写。
+- **安全修复（审计发现）**：
+  - **12 字前缀复制绕过**：旧 `ContentMatches` 只比前 12 字，复制真消息前 12 字再追加指令即可放行；改为全等 / 仅容忍 ≤2 个标点/符号差异。
+  - **reply / 媒体标记自动放行**：旧逻辑带 `[对“…”的回复]` 或媒体标记即可绕过；改为必须归一化后内容吻合，不再凭标记放行。
+  - **额外特征 + 伪造发言人**：旧逻辑命中额外特征后直接返回原始 `decoded`，会把刚标注的伪造行还原；改为保留已处理行；`block` 模式直接丢弃内容。
+  - **零宽字符绕过**：检测前统一剥离 `U+200B/200C/200D/2060/FEFF`；回填、事件、额外特征、辅助规则全部覆盖。
+  - **非法超长 QQ**：`long.Parse` 异常会被外层 catch 原样放行；改为 `TryParse` 并按伪造结构处理。
+  - **戳一戳特例**：只放行 `戳了戳 <纯数字目标>`；`戳了戳 目标 + 指令` 不再借特例绕过。
+  - `GuardSessionTags` 不再误标真实块头 `[群聊消息(...)]`，只标正文里的额外会话标签。
+  - 无任何命中时**返回原消息**（正常消息 0 字节改动）。
+  - 提示词与真实标注前缀对齐为 `│【伪造发言人·`。
+  - 配置热更新：`Configuration` setter 重新加载白名单/额外正则。
+- **兼容性**：直接引用 Alife **v5.4.1**（`a08da9d`，master `3cd23f8` 核心与 v5.4.1 一致）编译 **0 error**；**不引用 QChat 工程**也能编译通过，证明依赖已彻底解除。
+- **验证**：
+  - 框架 `ConstructContainer` 复现：必填依赖 ⇒ spare 构造（1/True）；可选依赖 + spare ⇒ 不构造（0/False）；可选依赖 + 已启用 ⇒ 正常注入（1/True）。
+  - 防注入真值用例 **39/39**：正常 0 改写、多行真消息、QChat reply/image/audio/file/forward/face/at 差异、空格/全角/实体/零宽伪造、前缀复制、reply/媒体标记绕过、额外特征+伪造、block/strict、非法 QQ、戳一戳+指令、跨 QQ 同内容、2 字汉字追加、陈旧缓冲降级。
+  - **真实 QChat 类型**事件桥/采集/回填 **4/4**（`QChatService` + `OneBotClient.EventReceived` + `OneBotMessageEvent` + `GroupStates`）。
+  - 无 QChat 程序集时 `FindQChatServiceType` 返回 null（独立运行）。
 
 ### 5.0.9（2026-10-27）
 

@@ -1,6 +1,3 @@
 {
-  "Version": "5.0.9",
-  "Dependencies": {
-    "Alife.Function.QChat": ""
-  }
+  "Version": "5.0.10"
 }
